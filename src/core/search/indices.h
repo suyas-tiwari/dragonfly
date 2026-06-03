@@ -124,6 +124,14 @@ template <typename C> struct BaseStringIndex : public BaseIndex {
       std::string_view infix,
       absl::FunctionRef<void(std::string_view term, const Container*)> cb) const;
 
+  // Iterate over all nodes whose term matches the glob pattern (`*` = any run of characters,
+  // `?` = exactly one, `\` escapes the next character). Scans entries_, narrowing the range by
+  // the pattern's literal prefix when present.
+  void MatchWildcard(std::string_view pattern, absl::FunctionRef<void(const Container*)> cb) const;
+  void MatchWildcardWithTerm(
+      std::string_view pattern,
+      absl::FunctionRef<void(std::string_view term, const Container*)> cb) const;
+
   // Returns all the terms that appear as keys in the reverse index.
   std::vector<std::string> GetTerms() const;
 
@@ -218,8 +226,7 @@ struct TextIndex : public BaseStringIndex<CompressedSortedSet> {
     return with_offsets_;
   }
 
-  // Tokenize a quoted phrase query: split on whitespace, lowercase, drop stopwords.
-  // Stems are NOT applied — phrase queries match raw token positions only.
+  // Stems are NOT applied to phrase queries; they match raw token positions only.
   std::vector<std::string> TokenizePhraseQuery(std::string_view phrase) const;
 
  protected:

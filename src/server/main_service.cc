@@ -91,6 +91,8 @@ ABSL_FLAG(bool, lua_resp2_legacy_float, false,
 ABSL_FLAG(uint32_t, multi_eval_squash_buffer, 4096, "Max buffer for squashed commands per script");
 
 ABSL_DECLARE_FLAG(bool, primary_port_http_enabled);
+ABSL_DECLARE_FLAG(size_t, listpack_max_field_len);
+ABSL_DECLARE_FLAG(size_t, listpack_max_bytes);
 ABSL_FLAG(bool, admin_nopass, false,
           "If set, would enable open admin access to console on the assigned port, without "
           "authorization needed.");
@@ -956,6 +958,8 @@ void RegisterMutableFlags(ConfigRegistry* reg, absl::Span<const std::string> nam
 
 void Service::Init(util::AcceptServer* acceptor, std::vector<facade::Listener*> listeners) {
   InitRedisTables();
+  server.max_map_field_len = absl::GetFlag(FLAGS_listpack_max_field_len);
+  server.max_listpack_map_bytes = absl::GetFlag(FLAGS_listpack_max_bytes);
   facade::Connection::Init(pp_.size());
 
 #if defined(WITH_SEARCH)
@@ -1315,7 +1319,7 @@ std::optional<ErrorReply> Service::VerifyCommandState(const CommandId& cid, CmdA
   const GlobalState gstate = etl.gstate();
   switch (gstate) {
     case GlobalState::LOADING:
-      allowed_by_state = dfly_cntx.journal_emulated || (cid.opt_mask() & CO::LOADING);
+      allowed_by_state = dfly_cntx.is_replicating || (cid.opt_mask() & CO::LOADING);
       break;
     case GlobalState::SHUTTING_DOWN:
       allowed_by_state = false;

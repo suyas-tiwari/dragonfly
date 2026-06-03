@@ -48,6 +48,86 @@ string ToLower(string_view word) {
   return IsAllAscii(word) ? absl::AsciiStrToLower(word) : una::cases::to_lowercase_utf8(word);
 }
 
+constexpr std::array<bool, 256> MakeSepTable() {
+  std::array<bool, 256> t{};
+  for (unsigned char c : std::string_view{" \t\n\r\v\f,.<>{}[]\"':;!@#$%^&*()-+=~?/|`"})
+    t[c] = true;
+  return t;
+}
+constexpr auto kTextSepTable = MakeSepTable();
+
+// Returns the byte length of the UTF-8 codepoint starting at `s[i]`. Returns 1 if the
+// lead byte announces a multi-byte sequence but the continuation bytes are missing or
+// not in 0x80..0xBF, matching the byte-oriented escape semantics of the query lexer
+// (which consumes exactly one byte after `\`).
+size_t Utf8CodepointLen(std::string_view s, size_t i) {
+  unsigned char lead = static_cast<unsigned char>(s[i]);
+  size_t len = 1;
+  if ((lead & 0xE0) == 0xC0)
+    len = 2;
+  else if ((lead & 0xF0) == 0xE0)
+    len = 3;
+  else if ((lead & 0xF8) == 0xF0)
+    len = 4;
+  if (len == 1)
+    return 1;
+  if (len > s.size() - i)
+    return 1;
+  for (size_t k = 1; k < len; ++k) {
+    unsigned char c = static_cast<unsigned char>(s[i + k]);
+    if ((c & 0xC0) != 0x80)
+      return 1;
+  }
+  return len;
+}
+
+// Split on ASCII punctuation separators; backslash glues the next codepoint into the
+// current word regardless of class. Non-ASCII bytes are always word bytes. Fast-path
+// for text without any backslash emits views into the original input.
+void SplitWithEscapes(std::string_view text, absl::FunctionRef<void(std::string_view)> emit) {
+  if (text.find('\\') == std::string_view::npos) {
+    size_t start = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+      unsigned char c = static_cast<unsigned char>(text[i]);
+      if (c < 0x80 && kTextSepTable[c]) {
+        if (i > start)
+          emit(text.substr(start, i - start));
+        start = i + 1;
+      }
+    }
+    if (start < text.size())
+      emit(text.substr(start));
+    return;
+  }
+
+  std::string buf;
+  buf.reserve(text.size());
+  size_t i = 0;
+  while (i < text.size()) {
+    unsigned char c = static_cast<unsigned char>(text[i]);
+    if (c == '\\') {
+      if (i + 1 >= text.size()) {
+        ++i;
+      } else {
+        size_t cp_len = Utf8CodepointLen(text, i + 1);
+        buf.append(text.data() + i + 1, cp_len);
+        i += 1 + cp_len;
+      }
+    } else if (c < 0x80 && kTextSepTable[c]) {
+      if (!buf.empty()) {
+        emit(buf);
+        buf.clear();
+      }
+      ++i;
+    } else {
+      buf.push_back(text[i]);
+      ++i;
+    }
+  }
+  if (!buf.empty())
+    emit(buf);
+}
+
 // Tokenize text into `out`, advancing *pos_counter per non-stopword token. Raw + stem +
 // synonym entries share the same position. Stopwords don't advance the counter.
 void TokenizeWords(std::string_view text, const TextIndex::StopWords& stopwords,
@@ -58,10 +138,14 @@ void TokenizeWords(std::string_view text, const TextIndex::StopWords& stopwords,
     info.freq++;
     info.positions.push_back(pos);
   };
-  for (std::string_view word : una::views::word_only::utf8(text)) {
+  SplitWithEscapes(text, [&](std::string_view word) {
     std::string word_lc = una::cases::to_lowercase_utf8(word);
+    // Leading-space tokens are reserved for synonym group sentinels; user input
+    // (e.g. an escaped leading space) must not be able to forge one.
+    if (word_lc.empty() || word_lc.front() == ' ')
+      return;
     if (stopwords.contains(word_lc))
-      continue;
+      return;
     uint32_t pos = ++(*pos_counter);
     if (synonyms) {
       if (auto group_id = synonyms->GetGroupToken(word_lc); group_id)
@@ -73,7 +157,7 @@ void TokenizeWords(std::string_view text, const TextIndex::StopWords& stopwords,
         emit(std::move(stem), pos);
     }
     emit(std::move(word_lc), pos);
-  }
+  });
 }
 
 // Split taglist, remove duplicates and convert all to lowercase. Freq is always 1 for tags;
@@ -100,10 +184,89 @@ void IterateAllSuffixes(const absl::flat_hash_set<string>& words,
   }
 }
 
+// Literal characters of `pat` up to the first unescaped `*` or `?`. Any term matching `pat` must
+// start with this, so it bounds the dictionary range that has to be scanned.
+string GlobLiteralPrefix(string_view pat) {
+  string prefix;
+  for (size_t i = 0; i < pat.size(); ++i) {
+    char c = pat[i];
+    if (c == '*' || c == '?')
+      break;
+    if (c == '\\' && i + 1 < pat.size())
+      c = pat[++i];
+    prefix.push_back(c);
+  }
+  return prefix;
+}
+
+// Longest run of literal characters in `pat` (bounded by unescaped `*`/`?`), with `\` escapes
+// resolved. Every term matching `pat` must contain this run as a contiguous substring, which the
+// suffix trie can test for a cheap early-exit.
+string GlobLongestLiteralSegment(string_view pat) {
+  string best, cur;
+  auto flush = [&] {
+    if (cur.size() > best.size())
+      best = cur;
+    cur.clear();
+  };
+  for (size_t i = 0; i < pat.size(); ++i) {
+    char c = pat[i];
+    if (c == '*' || c == '?') {
+      flush();
+      continue;
+    }
+    if (c == '\\' && i + 1 < pat.size())
+      c = pat[++i];
+    cur.push_back(c);
+  }
+  flush();
+  return best;
+}
+
+// Matches `text` against glob `pat`: `*` = any run (incl. empty), `?` = exactly one character,
+// `\` escapes the next character to a literal. Two-pointer scan with backtracking to the last `*`.
+// `?` and `*` advance over whole UTF-8 codepoints so single-character matching works on multibyte
+// text; literal bytes in the pattern still match the text byte-for-byte.
+bool GlobMatch(string_view text, string_view pat) {
+  size_t t = 0, p = 0;
+  size_t star_p = string_view::npos;  // pattern index just past the last `*`
+  size_t star_t = 0;                  // text index that `*` is currently matched up to
+  while (t < text.size()) {
+    if (p < pat.size()) {
+      char pc = pat[p];
+      if (pc == '*') {
+        star_p = ++p;
+        star_t = t;
+        continue;
+      }
+      if (pc == '?') {
+        ++p;
+        t += Utf8CodepointLen(text, t);
+        continue;
+      }
+      char lit = (pc == '\\' && p + 1 < pat.size()) ? pat[p + 1] : pc;
+      if (lit == text[t]) {
+        p += (pc == '\\' && p + 1 < pat.size()) ? 2 : 1;
+        ++t;
+        continue;
+      }
+    }
+    if (star_p == string_view::npos)
+      return false;
+    // Extend the last `*` by one codepoint so backtracking stays on character boundaries.
+    p = star_p;
+    star_t += Utf8CodepointLen(text, star_t);
+    t = star_t;
+  }
+  while (p < pat.size() && pat[p] == '*')
+    ++p;
+  return p == pat.size();
+}
+
 // Haversine with earth radius in meters. Used to calculate distance.
 boost::geometry::strategy::distance::haversine haversine_(6372797.560856);
 
-double ConvertToRadiusInMeters(size_t radius, std::string_view arg) {
+double ConvertToRadiusInMeters(double radius, std::string_view arg) {
   const std::string unit = absl::AsciiStrToUpper(arg);
   if (unit == "M") {
     return radius * 1;
@@ -428,6 +591,39 @@ void BaseStringIndex<C>::MatchInfixWithTerm(
 }
 
 template <typename C>
+void BaseStringIndex<C>::MatchWildcardWithTerm(
+    std::string_view pattern,
+    absl::FunctionRef<void(std::string_view term, const Container*)> cb) const {
+  StringOrView pattern_norm{NormalizeQueryWord(pattern)};
+  pattern = pattern_norm.view();
+
+  // Early-exit via the suffix trie: every matching term must contain the pattern's longest literal
+  // segment as a substring, so if no term does, skip the dictionary scan. Mirrors
+  // MatchInfixWithTerm.
+  if (suffix_trie_) {
+    string segment = GlobLongestLiteralSegment(pattern);
+    if (!segment.empty()) {
+      auto it = suffix_trie_->lower_bound(segment);
+      if (it == suffix_trie_->end() || !(*it).first.starts_with(segment))
+        return;
+    }
+  }
+
+  string prefix = GlobLiteralPrefix(pattern);
+  for (auto it = entries_.lower_bound(prefix);
+       it != entries_.end() && (*it).first.starts_with(prefix); ++it) {
+    if (GlobMatch((*it).first, pattern))
+      cb((*it).first, &(*it).second);
+  }
+}
+
+template <typename C>
+void BaseStringIndex<C>::MatchWildcard(std::string_view pattern,
+                                       absl::FunctionRef<void(const Container*)> cb) const {
+  MatchWildcardWithTerm(pattern, [&cb](string_view, const Container* c) { cb(c); });
+}
+
+template <typename C>
 bool BaseStringIndex<C>::Add(DocId id, const DocumentAccessor& doc, string_view field) {
   auto strings_list = GetStrings(doc, field);
   if (!strings_list) {
@@ -637,12 +833,12 @@ void TextIndex::Tokenize(std::string_view value, uint32_t* pos_counter,
 std::vector<std::string> TextIndex::TokenizePhraseQuery(std::string_view phrase) const {
   std::vector<std::string> out;
   const StopWords* sw = stopwords_;
-  for (std::string_view word : una::views::word_only::utf8(phrase)) {
+  SplitWithEscapes(phrase, [&](std::string_view word) {
     std::string lc = una::cases::to_lowercase_utf8(word);
     if (sw && sw->contains(lc))
-      continue;
+      return;
     out.push_back(std::move(lc));
-  }
+  });
   return out;
 }
 
