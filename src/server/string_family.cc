@@ -1011,13 +1011,23 @@ std::variant<SetCmd::SetParams, facade::ErrorReply, NegativeExpire> ParseSetPara
       if (int_arg <= 0)
         return facade::ErrorReply{InvalidExpireTime("set")};
 
+      // Prevention of integer overflow in case of malicious expiry value as input
+      if ((*exp_type == ExpT::EX || *exp_type == ExpT::EXAT) && int_arg > INT64_MAX / 1000) {
+        return facade::ErrorReply{InvalidExpireTime("set")};
+      }
+
+      // 1. Fetch the time first for using in the conversion math
+      int64_t now_ms = GetCurrentTimeMs();
+
+      // Conversion math
+      int64_t msec = (*exp_type == ExpT::EX || *exp_type == ExpT::EXAT) ? int_arg * 1000 : int_arg;
+      bool is_relative = (*exp_type == ExpT::EX || *exp_type == ExpT::PX);
+      int64_t final_ms = is_relative ? msec + now_ms : msec;
+
       DbSlice::ExpireParams expiry{
-          .value = int_arg,
-          .unit = *exp_type == ExpT::PX || *exp_type == ExpT::PXAT ? TimeUnit::MSEC : TimeUnit::SEC,
-          .absolute = *exp_type == ExpT::EXAT || *exp_type == ExpT::PXAT,
+          .ms_timestamp = final_ms,
       };
 
-      int64_t now_ms = GetCurrentTimeMs();
       auto [rel_ms, abs_ms] = expiry.Calculate(now_ms, false);
       if (abs_ms < 0)
         return facade::ErrorReply{InvalidExpireTime("set")};
@@ -1137,13 +1147,25 @@ cmd::CmdR CmdSetExGeneric(CmdArgList args, CommandContext* cmd_cntx) {
   if (exp_int < 1)
     co_return facade::ErrorReply{InvalidExpireTime(cmd_name)};
 
+  // Check if it's in seconds (Doesn't start with 'P')
+  bool is_seconds = (cmd_name.front() != 'P');
+
+  // Overflow Shield from malicious expiry times
+  if (is_seconds && exp_int > INT64_MAX / 1000) {
+    co_return facade::ErrorReply{InvalidExpireTime(cmd_name)};
+  }
+
+  // Fetch the time first for using in the conversion math
+  int64_t now_ms = GetCurrentTimeMs();
+
+  // Conversion math
+  int64_t msec = is_seconds ? exp_int * 1000 : exp_int;
+  int64_t final_ms = msec + now_ms;
+
   DbSlice::ExpireParams expiry{
-      .value = exp_int,
-      .unit = cmd_name.front() == 'P' ? TimeUnit::MSEC : TimeUnit::SEC,
-      .absolute = false,
+      .ms_timestamp = final_ms,
   };
 
-  int64_t now_ms = GetCurrentTimeMs();
   auto [_, abs_ms] = expiry.Calculate(now_ms, false);
   if (abs_ms < 0)
     co_return facade::ErrorReply{InvalidExpireTime("set")};
@@ -1305,10 +1327,19 @@ cmd::CmdR CmdGetEx(CmdArgList args, CommandContext* cmd_cntx) {
         co_return facade::ErrorReply{InvalidExpireTime("getex")};
       }
 
-      exp_params.absolute = *exp_type == ExpT::EXAT || *exp_type == ExpT::PXAT;
-      exp_params.value = int_arg;
-      exp_params.unit =
-          *exp_type == ExpT::PX || *exp_type == ExpT::PXAT ? TimeUnit::MSEC : TimeUnit::SEC;
+      // To prevent from overflow
+      if ((*exp_type == ExpT::EX || *exp_type == ExpT::EXAT) && int_arg > INT64_MAX / 1000) {
+        co_return facade::ErrorReply{InvalidExpireTime("getex")};
+      }
+
+      int64_t now_ms = GetCurrentTimeMs();
+
+      // The Translation Math
+      int64_t msec = (*exp_type == ExpT::EX || *exp_type == ExpT::EXAT) ? int_arg * 1000 : int_arg;
+      bool is_relative = (*exp_type == ExpT::EX || *exp_type == ExpT::PX);
+      int64_t final_ms = is_relative ? msec + now_ms : msec;
+
+      exp_params.ms_timestamp = final_ms;
       defined = true;
     } else if (parser.Check("PERSIST")) {
       exp_params.persist = true;
@@ -1514,8 +1545,9 @@ cmd::CmdR CmdGAT(CmdArgList args, CommandContext* cmd_cntx) {
     return cmd::kAborted;
   }
   int64_t expire_ts = cmd_cntx->mc_command()->expire_ts;
-  DbSlice::ExpireParams expire_params{
-      .value = expire_ts, .absolute = true, .persist = expire_ts == 0};
+  DbSlice::ExpireParams expire_params{// No overflow check needed here as value is passed as 32 bit
+                                      .ms_timestamp = expire_ts * 1000,
+                                      .persist = expire_ts == 0};
   return MGetGeneric(cmd_cntx, args, expire_params);
 }
 
