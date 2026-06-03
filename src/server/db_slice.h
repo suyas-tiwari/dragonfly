@@ -222,10 +222,10 @@ class DbSlice {
 
   struct ExpireParams {
     bool IsDefined() const {
-      return persist || value > INT64_MIN;
+      return persist || ms_timestamp > INT64_MIN;
     }
 
-    static int64_t Cap(int64_t value, TimeUnit unit);
+    static int64_t Cap(int64_t ms_value);
 
     // Calculate relative and absolue timepoints.
     std::pair<int64_t, int64_t> Calculate(uint64_t now_msec, bool cap) const;
@@ -236,10 +236,8 @@ class DbSlice {
     }
 
    public:
-    int64_t value = INT64_MIN;  // undefined
-    TimeUnit unit = TimeUnit::SEC;
+    int64_t ms_timestamp = INT64_MIN;  // INT64_MIN for placeholder value
 
-    bool absolute = false;
     bool persist = false;        // persist means remove all expiry
     int32_t expire_options = 0;  // ExpireFlags
   };

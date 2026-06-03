@@ -1368,7 +1368,12 @@ void GenericFamily::Expire(CmdArgList args, CommandContext* cmd_cntx) {
   if (!expire_options) {
     return cmd_cntx->SendError(expire_options.error());
   }
-  DbSlice::ExpireParams params{.value = int_arg, .expire_options = expire_options.value()};
+
+  int64_t now_ms = GetCurrentTimeMs();
+
+  int64_t final_ms = now_ms + (int_arg * 1000);
+
+  DbSlice::ExpireParams params{.ms_timestamp = final_ms, .expire_options = expire_options.value()};
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpExpire(t->GetOpArgs(shard), key, params);
@@ -1386,12 +1391,25 @@ void GenericFamily::ExpireAt(CmdArgList args, CommandContext* cmd_cntx) {
   }
 
   int_arg = std::max<int64_t>(int_arg, 0L);
+
+  int64_t now_ms = GetCurrentTimeMs();
+  int64_t max_timestamp_sec = (now_ms + kMaxExpireDeadlineMs) / 1000;
+  if (int_arg > max_timestamp_sec) {
+    int_arg = max_timestamp_sec;
+  }
+
+  if (int_arg > INT64_MAX / 1000)
+    return cmd_cntx->SendError(InvalidExpireTime("expireat"));
+
   auto expire_options = ParseExpireOptionsOrReply(args.subspan(2));
   if (!expire_options) {
     return cmd_cntx->SendError(expire_options.error());
   }
-  DbSlice::ExpireParams params{
-      .value = int_arg, .absolute = true, .expire_options = expire_options.value()};
+
+  int64_t timestamp_ms = int_arg * 1000;
+
+  DbSlice::ExpireParams params{.ms_timestamp = timestamp_ms,
+                               .expire_options = expire_options.value()};
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpExpire(t->GetOpArgs(shard), key, params);
@@ -1435,14 +1453,21 @@ void GenericFamily::PexpireAt(CmdArgList args, CommandContext* cmd_cntx) {
   }
 
   int_arg = std::max<int64_t>(int_arg, 0L);
+
+  int64_t now_ms = GetCurrentTimeMs();
+  int64_t max_timestamp_ms = now_ms + kMaxExpireDeadlineMs;
+  if (int_arg > max_timestamp_ms) {
+    int_arg = max_timestamp_ms;
+  }
+
   auto expire_options = ParseExpireOptionsOrReply(args.subspan(2));
   if (!expire_options) {
     return cmd_cntx->SendError(expire_options.error());
   }
-  DbSlice::ExpireParams params{.value = int_arg,
-                               .unit = TimeUnit::MSEC,
-                               .absolute = true,
-                               .expire_options = expire_options.value()};
+  DbSlice::ExpireParams params{
+      .ms_timestamp = int_arg,
+      .expire_options = expire_options.value(),
+  };
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpExpire(t->GetOpArgs(shard), key, params);
@@ -1473,8 +1498,12 @@ void GenericFamily::Pexpire(CmdArgList args, CommandContext* cmd_cntx) {
   if (!expire_options) {
     return cmd_cntx->SendError(expire_options.error());
   }
-  DbSlice::ExpireParams params{
-      .value = int_arg, .unit = TimeUnit::MSEC, .expire_options = expire_options.value()};
+
+  int64_t now_ms = GetCurrentTimeMs();
+
+  int64_t final_ms = int_arg + now_ms;
+
+  DbSlice::ExpireParams params{.ms_timestamp = final_ms, .expire_options = expire_options.value()};
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     return OpExpire(t->GetOpArgs(shard), key, params);
